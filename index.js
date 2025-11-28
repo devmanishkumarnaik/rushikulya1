@@ -256,9 +256,8 @@ const Subject = mongoose.model('Subject', subjectSchema);
 const attendanceSchema = new mongoose.Schema({
   studentId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   studentName: { type: String, required: true },
+  rollNumber: { type: String, required: true },
   class: { type: String, required: true },
-  subjectId: { type: mongoose.Schema.Types.ObjectId, ref: 'Subject', required: true },
-  subjectName: { type: String, required: true },
   date: { type: Date, required: true },
   status: { type: String, enum: ['present', 'absent'], required: true },
   markedBy: { type: String, required: true }, // Teacher or Admin name
@@ -266,8 +265,8 @@ const attendanceSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 
-// Create compound index to prevent duplicate attendance for same student, subject, and date
-attendanceSchema.index({ studentId: 1, subjectId: 1, date: 1 }, { unique: true });
+// Create compound index to prevent duplicate attendance for same student and date (only one attendance per day)
+attendanceSchema.index({ studentId: 1, date: 1 }, { unique: true });
 
 const Attendance = mongoose.model('Attendance', attendanceSchema);
 
@@ -2275,7 +2274,6 @@ app.get('/api/attendance', async (req, res) => {
   try {
     const attendance = await Attendance.find()
       .populate('studentId', 'firstName lastName class rollNumber')
-      .populate('subjectId', 'name class')
       .sort({ date: -1 });
     res.json(attendance);
   } catch (error) {
@@ -2288,7 +2286,6 @@ app.get('/api/attendance/student/:studentId', async (req, res) => {
   try {
     const { studentId } = req.params;
     const attendance = await Attendance.find({ studentId })
-      .populate('subjectId', 'name')
       .sort({ date: -1 });
     res.json(attendance);
   } catch (error) {
@@ -2302,7 +2299,6 @@ app.get('/api/attendance/class/:class', async (req, res) => {
     const { class: className } = req.params;
     const attendance = await Attendance.find({ class: className })
       .populate('studentId', 'firstName lastName rollNumber')
-      .populate('subjectId', 'name')
       .sort({ date: -1 });
     res.json(attendance);
   } catch (error) {
@@ -2310,18 +2306,20 @@ app.get('/api/attendance/class/:class', async (req, res) => {
   }
 });
 
-// Get attendance by subject and date range
-app.get('/api/attendance/subject/:subjectId', async (req, res) => {
+// Get attendance by date range
+app.get('/api/attendance/date-range', async (req, res) => {
   try {
-    const { subjectId } = req.params;
-    const { startDate, endDate } = req.query;
+    const { startDate, endDate, class: className } = req.query;
     
-    const query = { subjectId };
+    const query = {};
     if (startDate && endDate) {
       query.date = {
         $gte: new Date(startDate),
         $lte: new Date(endDate)
       };
+    }
+    if (className) {
+      query.class = className;
     }
     
     const attendance = await Attendance.find(query)
@@ -2329,14 +2327,14 @@ app.get('/api/attendance/subject/:subjectId', async (req, res) => {
       .sort({ date: -1 });
     res.json(attendance);
   } catch (error) {
-    res.status(500).json({ message: 'Error fetching subject attendance', error: error.message });
+    res.status(500).json({ message: 'Error fetching attendance', error: error.message });
   }
 });
 
 // Mark attendance (teacher or admin)
 app.post('/api/attendance/mark', authMiddleware, async (req, res) => {
   try {
-    const { attendanceRecords } = req.body; // Array of { studentId, subjectId, date, status }
+    const { attendanceRecords } = req.body; // Array of { studentId, date, status }
     const user = await User.findById(req.userId);
     
     if (!user) {
@@ -2349,33 +2347,26 @@ app.post('/api/attendance/mark', authMiddleware, async (req, res) => {
     
     for (const record of attendanceRecords) {
       try {
-        const { studentId, subjectId, date, status } = record;
+        const { studentId, date, status } = record;
         
-        // Get student and subject details
+        // Get student details
         const student = await User.findById(studentId);
-        const subject = await Subject.findById(subjectId);
         
         if (!student) {
           errors.push({ studentId, error: 'Student not found' });
           continue;
         }
         
-        if (!subject) {
-          errors.push({ studentId, subjectId, error: 'Subject not found' });
-          continue;
-        }
-        
-        // Use findOneAndUpdate with upsert to handle duplicates
+        // Use findOneAndUpdate with upsert to handle duplicates (only one attendance per day)
         const attendance = await Attendance.findOneAndUpdate(
           {
             studentId,
-            subjectId,
             date: new Date(date)
           },
           {
             studentName: `${student.firstName} ${student.lastName}`,
+            rollNumber: student.rollNumber,
             class: student.class,
-            subjectName: subject.name,
             status,
             markedBy,
             markedByUserId: req.userId
@@ -2466,17 +2457,13 @@ app.get('/api/attendance/summary/student/:studentId', async (req, res) => {
     const attendance = await Attendance.find({
       studentId,
       date: { $gte: startDate, $lte: endDate }
-    }).populate('subjectId', 'name');
+    });
     
-    // Group by subject
-    const summary = {};
+    // Calculate overall summary
+    const summary = { present: 0, absent: 0, total: 0 };
     attendance.forEach(record => {
-      const subjectName = record.subjectName;
-      if (!summary[subjectName]) {
-        summary[subjectName] = { present: 0, absent: 0, total: 0 };
-      }
-      summary[subjectName][record.status]++;
-      summary[subjectName].total++;
+      summary[record.status]++;
+      summary.total++;
     });
     
     res.json({ summary, records: attendance });
